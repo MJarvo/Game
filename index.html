@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+<title>Jump & Grab – Camera Kids Game</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#111;color:#fff;font-family:system-ui,Arial}
+  #stage{position:fixed;inset:0;display:grid;grid-template-rows:auto 1fr auto;gap:8px;padding:8px;box-sizing:border-box}
+  #hud{display:flex;gap:8px;align-items:center;justify-content:space-between}
+  #leftHUD{display:flex;gap:8px;align-items:center}
+  #btns>button,select{font-size:14px;padding:8px 10px;border-radius:10px;border:0;background:#222;color:#fff}
+  #score{font-weight:700}
+  #game{position:relative;border-radius:12px;overflow:hidden;background:#000}
+  video,canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+  #overlay{pointer-events:none}
+  #footer{font-size:12px;opacity:.8}
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="hud">
+    <div id="leftHUD">
+      <span id="score">Score: 0</span>
+      <span id="status">• Ready</span>
+    </div>
+    <div id="btns">
+      <select id="camFacing">
+        <option value="environment">Rear camera</option>
+        <option value="user">Front camera</option>
+      </select>
+      <button id="startBtn">Start</button>
+      <button id="pauseBtn">Pause</button>
+      <button id="resetBtn">Reset</button>
+    </div>
+  </div>
+
+  <div id="game">
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div id="footer">
+    How to play: stand ~2–3m from camera. Jump to collect coins. Touch orbs with your hands. Tip: good light helps tracking.
+  </div>
+</div>
+
+<!-- TensorFlow.js + MediaPipe Pose (CDNs) -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5/pose.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3/camera_utils.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.3/drawing_utils.js"></script>
+
+<script>
+(() => {
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('overlay');
+  const ctx = canvas.getContext('2d');
+  const startBtn = document.getElementById('startBtn');
+  const pauseBtn = document.getElementById('pauseBtn');
+  const resetBtn = document.getElementById('resetBtn');
+  const camFacing = document.getElementById('camFacing');
+  const scoreEl = document.getElementById('score');
+  const statusEl = document.getElementById('status');
+
+  let stream = null;
+  let running = false;
+  let paused = false;
+  let score = 0;
+
+  // Game objects
+  const coins = [];   // jump targets (collected by nose)
+  const orbs  = [];   // hand targets
+  let lastSpawn = 0;
+
+  // Jump detection baseline
+  let hipBaseline = null;
+  const JUMP_THRESHOLD = 60; // px upwards from baseline
+
+  // Resize canvas to video box
+  function fitCanvas() {
+    const rect = document.getElementById('game').getBoundingClientRect();
+    canvas.width = rect.width;
+    canvas.height = rect.height;
+  }
+  window.addEventListener('resize', fitCanvas);
+  fitCanvas();
+
+  function setStatus(msg) { statusEl.textContent = `• ${msg}`; }
+  function setScore(n) { score = n; scoreEl.textContent = `Score: ${score}`; }
+
+  async function startCamera(facingMode='environment') {
+    if (stream) {
+      stream.getTracks().forEach(t => t.stop());
+      stream = null;
+    }
+    const constraints = {
+      audio: false,
+      video: {
+        facingMode,
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
+      }
+    };
+    stream = await navigator.mediaDevices.getUserMedia(constraints);
+    video.srcObject = stream;
+    await video.play();
+    setStatus('Camera on');
+  }
+
+  function spawnItems(now) {
+    if (now - lastSpawn < 1200) return;
+    lastSpawn = now;
+
+    // Coin spawns mid-air, falls slowly
+    coins.push({
+      x: Math.random() * canvas.width,
+      y: canvas.height * (0.25 + Math.random()*0.3),
+      r: 26,
+      vy: 0.4 + Math.random()*0.3,
+      alive: true
+    });
+
+    // Orb spawns at top, falls faster
+    orbs.push({
+      x: Math.random() * canvas.width,
+      y: -30,
+      r: 34,
+      vy: 1.2 + Math.random()*0.6,
+      alive: true
+    });
+
+    // Keep lists short
+    if (coins.length > 12) coins.shift();
+    if (orbs.length > 12) orbs.shift();
+  }
+
+  function drawItems() {
+    // Coins
+    coins.forEach(c => {
+      ctx.beginPath();
+      ctx.arc(c.x, c.y, c.r, 0, Math.PI*2);
+      ctx.fillStyle = '#f5c542';
+      ctx.fill();
+      ctx.lineWidth = 4; ctx.strokeStyle = '#8a6a12'; ctx.stroke();
+      // star shine
+      ctx.beginPath();
+      ctx.moveTo(c.x-6, c.y); ctx.lineTo(c.x+6, c.y);
+      ctx.moveTo(c.x, c.y-6); ctx.lineTo(c.x, c.y+6);
+      ctx.lineWidth = 2; ctx.strokeStyle = '#fff'; ctx.stroke();
+    });
+    // Orbs
+    orbs.forEach(o => {
+      const grad = ctx.createRadialGradient(o.x, o.y, 4, o.x, o.y, o.r);
+      grad.addColorStop(0, 'rgba(100,200,255,0.9)');
+      grad.addColorStop(1, 'rgba(50,120,255,0.1)');
+      ctx.beginPath();
+      ctx.arc(o.x, o.y, o.r, 0, Math.PI*2);
+      ctx.fillStyle = grad;
+      ctx.fill();
+      ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(180,220,255,0.6)'; ctx.stroke();
+    });
+  }
+
+  function updateItems() {
+    coins.forEach(c => { c.y += c.vy; if (c.y > canvas.height + 40) c.alive = false; });
+    orbs.forEach(o => { o.y += o.vy; if (o.y > canvas.height + 40) o.alive = false; });
+  }
+
+  function prune() {
+    for (let i = coins.length-1; i>=0; i--) if (!coins[i].alive) coins.splice(i,1);
+    for (let i = orbs.length-1; i>=0; i--) if (!orbs[i].alive) orbs.splice(i,1);
+  }
+
+  // MediaPipe Pose
+  const pose = new Pose.Pose({
+    locateFile: file => `https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5/${file}`
+  });
+  pose.setOptions({
+    modelComplexity: 1,
+    selfieMode: true,
+    smoothLandmarks: true,
+    enableSegmentation: false,
+    minDetectionConfidence: 0.5,
+    minTrackingConfidence: 0.5
+  });
+
+  pose.onResults(onPose);
+
+  let camera = null;
+
+  function startPipeline() {
+    camera = new Camera(video, {
+      onFrame: async () => {
+        if (!running || paused) return;
+        await pose.send({image: video});
+      },
+      width: 1280,
+      height: 720
+    });
+    camera.start();
+  }
+
+  function toCanvasXY(landmark) {
+    // MediaPipe gives normalized [0..1]
+    return {
+      x: landmark.x * canvas.width,
+      y: landmark.y * canvas.height,
+      z: landmark.z
+    };
+  }
+
+  function circleHit(ax, ay, bx, by, r) {
+    const dx = ax - bx, dy = ay - by;
+    return (dx*dx + dy*dy) <= r*r;
+  }
+
+  function onPose(results) {
+    // Draw camera frame
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.save();
+    ctx.scale(-1,1); // mirror for selfie feel
+    ctx.drawImage(results.image, -canvas.width, 0, canvas.width, canvas.height);
+    ctx.restore();
+
+    // Spawn and move items
+    const now = performance.now();
+    spawnItems(now);
+    updateItems();
+
+    // If landmarks exist, compute interactions
+    if (results.poseLandmarks && results.poseLandmarks.length) {
+      const lm = results.poseLandmarks;
+
+      // Key points
+      const nose = toCanvasXY(lm[0]);
+      const leftHip  = toCanvasXY(lm[23]);
+      const rightHip = toCanvasXY(lm[24]);
+      const hipsY = (leftHip.y + rightHip.y)/2;
+
+      const leftWrist  = toCanvasXY(lm[15]);
+      const rightWrist = toCanvasXY(lm[16]);
+
+      // Establish baseline for jump (first stable frames)
+      if (hipBaseline === null) hipBaseline = hipsY;
+      else hipBaseline = 0.92*hipBaseline + 0.08*hipsY; // slow filter
+
+      const jumpActive = (hipBaseline - hipsY) > JUMP_THRESHOLD;
+
+      // Jump coin collection: nose vs coin when jumpActive
+      coins.forEach(c => {
+        if (!c.alive) return;
+        if (jumpActive && circleHit(nose.x, nose.y, c.x, c.y, c.r + 24)) {
+          c.alive = false; setScore(score + 5);
+        }
+      });
+
+      // Hand orbs collection
+      orbs.forEach(o => {
+        if (!o.alive) return;
+        if (circleHit(leftWrist.x, leftWrist.y, o.x, o.y, o.r + 20) ||
+            circleHit(rightWrist.x, rightWrist.y, o.x, o.y, o.r + 20)) {
+          o.alive = false; setScore(score + 3);
+        }
+      });
+
+      // Draw minimal skeleton for feedback
+      ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(0,255,140,0.9)';
+      ctx.fillStyle = jumpActive ? 'rgba(255,90,0,0.9)' : 'rgba(0,180,255,0.9)';
+
+      [nose,leftWrist,rightWrist,leftHip,rightHip].forEach(p=>{
+        ctx.beginPath(); ctx.arc(p.x, p.y, 6, 0, Math.PI*2); ctx.fill();
+      });
+      // hips line
+      ctx.beginPath(); ctx.moveTo(leftHip.x, leftHip.y); ctx.lineTo(rightHip.x, rightHip.y); ctx.stroke();
+
+      // Baseline marker
+      ctx.setLineDash([6,6]); ctx.strokeStyle='rgba(255,255,255,0.35)';
+      ctx.beginPath(); ctx.moveTo(0, hipBaseline); ctx.lineTo(canvas.width, hipBaseline); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    drawItems();
+    prune();
+  }
+
+  // Controls
+  startBtn.addEventListener('click', async () => {
+    try {
+      await startCamera(camFacing.value);
+      fitCanvas();
+      running = true; paused = false; setStatus('Running');
+      startPipeline();
+    } catch (e) {
+      setStatus('Camera blocked'); console.error(e);
+      alert('Camera permission is required. Use HTTPS and allow camera.');
+    }
+  });
+
+  pauseBtn.addEventListener('click', () => {
+    if (!running) return;
+    paused = !paused;
+    setStatus(paused ? 'Paused' : 'Running');
+  });
+
+  resetBtn.addEventListener('click', () => {
+    coins.length = 0; orbs.length = 0;
+    hipBaseline = null; setScore(0);
+    setStatus('Reset');
+  });
+
+  camFacing.addEventListener('change', async () => {
+    if (!running) return;
+    await startCamera(camFacing.value);
+  });
+
+  // iOS full-screen hint: tap video to hide address bar
+  document.getElementById('game').addEventListener('click', () => window.scrollTo(0,1), {passive:true});
+})();
+</script>
+</body>
+</html>
